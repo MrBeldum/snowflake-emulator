@@ -663,10 +663,13 @@ are not supported or have limited support:
 
 - Production authentication and object-level authorization. Local
   `gosnowflake` sessions authenticate users and roles, while REST/UI requests
-  remain anonymous. Warehouse `USAGE` and `OPERATE` are enforced for
-  authenticated sessions, but table privileges such as `GRANT SELECT`, along
-  with ownership transfer, secondary roles, and database roles, remain outside
-  the current subset.
+  remain anonymous. Authenticated sessions enforce warehouse `USAGE` and
+  `OPERATE`; namespace `USAGE` on databases and schemas; `CREATE TABLE` on
+  schemas; and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on tables. Grants are
+  inherited through the active role hierarchy and are checked before warehouse
+  admission. Ownership transfer, secondary roles, future grants, stage
+  privileges, row policies, and database roles remain outside the current
+  subset.
 - Procedures use caller-rights rather than Snowflake's full configurable
   caller/owner-rights model. `COPY INTO` and streams enforce warehouse compute
   authorization, but stage and table object privileges are not implemented.
