@@ -63,6 +63,13 @@ type SchemaContext struct {
 	SchemaID     string
 }
 
+// PrincipalContext is identity established by authenticated session handling.
+type PrincipalContext struct {
+	UserID   string
+	Username string
+	RoleID   string
+}
+
 // ExecutionContext contains the Snowflake session context used to resolve
 // unqualified object names while executing a statement.
 type ExecutionContext struct {
@@ -70,7 +77,13 @@ type ExecutionContext struct {
 	Schema    string
 	Warehouse string
 	Role      string
+	Principal *PrincipalContext
 	SessionID string
+	// Warehouse lifecycle callbacks are used by the statement API to expose
+	// queue transitions while Acquire is blocking.
+	OnWarehouseQueued  func()
+	OnWarehouseRunning func()
+	warehouseAcquired  bool
 
 	// RowLimit caps how many rows a query materializes. Zero uses the
 	// executor's default. It lives here because it is a property of one

@@ -229,14 +229,14 @@ func matchingParen(sql string, open int) int {
 }
 
 var sqlKeywords = map[string]bool{
-	"SET":    true,
-	"VALUES": true,
-	"SELECT": true,
-	"WHERE":  true,
-	"FROM":   true,
-	"USING":  true,
-	"ON":     true,
-	"AS":     true,
+	"SET":            true,
+	"VALUES":         true,
+	sqlKeywordSelect: true,
+	"WHERE":          true,
+	"FROM":           true,
+	"USING":          true,
+	"ON":             true,
+	"AS":             true,
 }
 
 // rewriteContextualTableReferences maps unqualified Snowflake table names to
@@ -472,7 +472,7 @@ func (e *Executor) validateExecutionContext(ctx context.Context, executionContex
 		}
 	}
 
-	if executionContext.Role != "" {
+	if executionContext.Role != "" && (executionContext.Principal == nil || executionContext.Principal.RoleID == "" || executionContext.Principal.UserID == "") {
 		return fmt.Errorf("role %s cannot be validated: role management is not implemented", executionContext.Role)
 	}
 

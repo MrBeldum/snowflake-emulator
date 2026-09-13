@@ -38,7 +38,22 @@ rows, _ := db.Query("SELECT IFF(1>0,'yes','no')")  // Supported Snowflake syntax
 - Cheap & fast CI smoke tests for Snowflake SQL
 - Validate Snowflake-ish SQL behavior before hitting real Snowflake
 
-> **Note**: This is a dev/test emulator — no auth, no clustering, no external stages, no JS stored procedures. See [Limitations](#limitations) for details.
+> **Note**: This is a dev/test emulator — its local authentication is not a production security boundary, and it has no clustering, external stages, or JS stored procedures. See [Limitations](#limitations) for details.
+
+### Local demonstration identity
+
+On the first start with an empty identity catalog, the emulator creates a
+demonstration administrator with username `ADMIN`, password `admin`, and
+default role `ACCOUNTADMIN`. The password is stored as a bcrypt hash and an
+existing catalog is never reset during restart.
+
+These credentials are intentionally convenient for local study only. The
+`gosnowflake` login authenticates against this catalog, resolves the requested
+or default role, and persists that identity in the session. `USE ROLE`,
+`CURRENT_USER()`, and `CURRENT_ROLE()` use the authenticated session context.
+The REST statement API and browser console remain anonymous in this phase, and
+object privilege enforcement is planned separately, so this must not be
+treated as production security.
 
 ## Overview
 
@@ -159,7 +174,7 @@ assets and no separate process.
 | **Worksheets** | Tabbed SQL editor with syntax highlighting. `Cmd`/`Ctrl` + `Enter` runs the statement under the cursor, or the selection. Multiple statements in one buffer are split correctly — including procedure bodies between `$$`, which are full of semicolons. Worksheets, their names and their execution context are kept in the browser, and tabs can be dragged into any order. A running statement can be canceled, and results exported as CSV or JSON. |
 | **Translated SQL** | Shows the DuckDB SQL a statement becomes, beside what you wrote, without running it. Statements handled by a processor (COPY, MERGE, procedures) say so rather than showing a partial translation as though it were the whole story. |
 | **Object explorer** | Databases, schemas, tables, streams, procedures, tasks and stages. Clicking an object writes its name into the editor. |
-| **Warehouses** | Create, resume, suspend and drop. Compute is emulated: a suspended warehouse changes what the API reports, not where statements run. |
+| **Warehouses** | Persistent lifecycle, auto-resume/auto-suspend, FIFO admission queues, size-based logical slots, and SQL/REST/UI management. |
 | **History** | Recent statements with their status, duration and handle. Click one to reopen it in a new worksheet. Statements are kept for seven days, and survive a restart when the emulator is run against a database file (`DB_PATH`); with the default in-memory database they go when the process does. |
 
 > **Note**: The console is an original interface for this emulator. It is not
@@ -330,7 +345,10 @@ procedure uses the procedure call's database and schema context. Dynamic
 identifiers currently support simple unquoted object names; qualified/quoted
 names remain limited. During a `CALL`, temporary tables use a single pinned
 DuckDB connection, remain isolated from concurrent calls, and are cleaned up
-when the invocation finishes.
+when the invocation finishes. Procedures use caller-rights in this emulator:
+the caller's authenticated active role remains authoritative for nested SQL.
+The creator role is persisted as metadata but does not elevate execution, and
+the outer `CALL` acquires one warehouse slot that nested statements reuse.
 
 ### Append-Only Streams
 
@@ -362,6 +380,10 @@ reads from it advances its offset, so the same changes are not returned again:
 INSERT INTO processed_users
 SELECT id, name FROM users_stream;
 ```
+
+The creator role is retained in stream metadata. Stream reads and consuming
+DML are compute operations and require `USAGE` on the active warehouse; stream
+ownership does not substitute for that privilege.
 
 ### Tasks
 
@@ -398,6 +420,9 @@ Tasks in `STARTED` state run automatically. The scheduler currently supports
 second, minute, and hour intervals, such as `1 SECOND`, `5 MINUTES`, or
 `2 HOURS`. `USING CRON` schedules are not supported yet. `EXECUTE TASK` remains
 available for immediate manual execution, including while a task is suspended.
+Scheduled tasks execute under their persisted creator role. A missing owner
+role or revoked warehouse `USAGE` fails closed before admission; manual task
+execution uses the authenticated caller's active role.
 
 ## Next Steps
 
@@ -460,7 +485,7 @@ go run ./example/gosnowflake
 | `/api/v2/databases/{db}/schemas/{schema}/stages/{stage}` | DELETE | Drop an internal stage and its files |
 | `/api/v2/databases/{db}/schemas/{schema}/stages/{stage}/files` | GET, POST | List files or upload one multipart `file` (maximum 64 MiB) |
 | `/api/v2/warehouses` | GET, POST | List/Create warehouses |
-| `/api/v2/warehouses/{wh}` | GET, DELETE | Get/Drop warehouse |
+| `/api/v2/warehouses/{wh}` | GET, PUT, DELETE | Get/Alter/Drop warehouse |
 | `/api/v2/warehouses/{wh}:resume` | POST | Resume warehouse |
 | `/api/v2/warehouses/{wh}:suspend` | POST | Suspend warehouse |
 | `/health` | GET | Health check |
@@ -485,6 +510,8 @@ The emulator supports standard SQL operations with automatic Snowflake-to-DuckDB
 | **DDL** | `CREATE [OR REPLACE] TEMPORARY TABLE ... AS <query>` | A true DuckDB TEMP table, visible to every statement in the session |
 | **DDL** | `CREATE DATABASE`, `DROP DATABASE` | Database management |
 | **DDL** | `CREATE SCHEMA`, `DROP SCHEMA` | Schema namespace management |
+| **DDL** | `CREATE WAREHOUSE`, `ALTER WAREHOUSE ... RESUME/SUSPEND/SET`, `SHOW WAREHOUSES`, `DROP WAREHOUSE` | Virtual warehouse lifecycle and configuration |
+| **Identity** | `CREATE/ALTER/DROP USER`, `CREATE/DROP ROLE`, `GRANT/REVOKE ROLE`, `GRANT/REVOKE USAGE/OPERATE ON WAREHOUSE`, `SHOW USERS/ROLES/GRANTS` | Persistent local users, inherited roles, and warehouse access control |
 | **DDL** | `CREATE [OR REPLACE] STAGE`, `DROP STAGE` | Named internal stages |
 | **Transaction** | `BEGIN`, `COMMIT`, `ROLLBACK` | Transaction control |
 | **Data Loading** | `LIST @stage`, `COPY INTO` | Upload and load CSV or JSON files from named internal stages |
@@ -500,6 +527,23 @@ Schemas and persistent/transient tables created through SQL are synchronized
 with the emulator catalog, so they are visible through the REST object explorer.
 Temporary tables remain connection-scoped and are not stored in the global
 catalog.
+
+Statements that read or mutate data require a selected warehouse. A suspended
+warehouse resumes on demand when `AUTO_RESUME` is enabled; otherwise the
+statement is rejected until an explicit resume. Each size doubles logical
+admission slots from `X-SMALL=1`, and excess work waits in a FIFO queue.
+Warehouses and their settings persist when `DB_PATH` names a database file,
+but restart in `SUSPENDED` state. This models Snowflake lifecycle and queuing;
+all admitted work still shares the local DuckDB engine, so a larger warehouse
+does not guarantee that one query runs faster.
+
+Authenticated `gosnowflake` sessions require `USAGE` on their selected
+warehouse before compute can be admitted, and `OPERATE` for `ALTER WAREHOUSE`
+or `DROP WAREHOUSE`. Privileges granted to a child role are inherited by its
+parent roles. `ACCOUNTADMIN` has an explicit compatibility bypass. Authorization
+runs before auto-resume and queue admission, so rejected work consumes no slot.
+The currently anonymous REST/UI path retains a local-study bypass in this phase;
+the request body's `role` field is never accepted as an authenticated principal.
 
 Ordinary views are persisted by DuckDB and synchronized with the emulator
 catalog. Their query body is evaluated when selected, like a regular view;
@@ -617,7 +661,8 @@ again unless the first command used `PURGE = TRUE`.
 This emulator is designed for development and testing. The following features
 are not supported or have limited support:
 
-- Authentication/Authorization (skipped in dev mode)
+- Production authentication and object-level authorization — local `gosnowflake` sessions authenticate users and roles, while REST/UI requests remain anonymous. Authenticated sessions enforce warehouse `USAGE` and `OPERATE`; namespace `USAGE` on databases and schemas; `CREATE TABLE` on schemas; and `SELECT`, `INSERT`, `UPDATE`, and `DELETE` on tables. Grants are inherited through the active role hierarchy and are checked before warehouse admission. Ownership transfer, secondary roles, future grants, stage privileges, row policies, and database roles remain outside the current subset.
+- Procedures use caller-rights rather than Snowflake's full configurable caller/owner-rights model. `COPY INTO` and streams enforce warehouse compute authorization, but stage and table object privileges are not implemented.
 - Distributed processing / Clustering
 - Time Travel / Zero-Copy Cloning
 - Task graphs, task dependencies, `USING CRON` schedules, and Pipes

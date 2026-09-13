@@ -14,6 +14,7 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/connection"
+	"github.com/nnnkkk7/snowflake-emulator/pkg/identity"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/metadata"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/query"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/session"
@@ -71,7 +72,25 @@ func main() {
 		return
 	}
 
-	sessionMgr := session.NewManager(24 * time.Hour)
+	// Identity is persisted now so future authentication and authorization
+	// layers can share one catalog. Query execution remains unauthenticated in
+	// this phase; constructing the service only bootstraps system identities.
+	identityService, err := identity.NewService(context.Background(), repo)
+	if err != nil {
+		log.Printf("Failed to initialize identity catalog: %v", err)
+		return
+	}
+
+	sessionStore, err := session.NewStore(connMgr)
+	if err != nil {
+		log.Printf("Failed to initialize session store: %v", err)
+		return
+	}
+	sessionMgr, err := session.NewPersistentManager(context.Background(), 24*time.Hour, sessionStore)
+	if err != nil {
+		log.Printf("Failed to restore sessions: %v", err)
+		return
+	}
 	stmtMgr := query.NewStatementManager(1 * time.Hour)
 
 	// Statements are recorded so the console's history outlives the manager's
@@ -94,12 +113,20 @@ func main() {
 	executor.Configure(
 		query.WithStageManager(stageMgr),
 		query.WithMergeProcessor(mergeProcessor),
+		query.WithIdentityService(identityService),
 	)
-	warehouseMgr := warehouse.NewManager()
+	warehouseMgr, err := warehouse.NewPersistentManager(context.Background(), repo)
+	if err != nil {
+		log.Printf("Failed to initialize warehouses: %v", err)
+		return
+	}
+	warehouseContext, stopWarehouses := context.WithCancel(context.Background())
+	defer stopWarehouses()
+	warehouseMgr.StartAutoSuspend(warehouseContext, time.Second)
 
-	sessionHandler := handlers.NewSessionHandler(sessionMgr, repo)
-	queryHandler := handlers.NewQueryHandler(executor, sessionMgr)
-	restAPIHandler := handlers.NewRestAPIv2HandlerWithServices(executor, stmtMgr, repo, warehouseMgr, stageMgr)
+	sessionHandler := handlers.NewSessionHandler(sessionMgr, repo, identityService, warehouseMgr)
+	queryHandler := handlers.NewQueryHandler(executor, sessionMgr, identityService)
+	restAPIHandler := handlers.NewRestAPIv2HandlerWithServices(executor, stmtMgr, repo, warehouseMgr, stageMgr, sessionMgr, identityService)
 	taskScheduler := query.NewTaskScheduler(repo, executor, time.Second)
 	taskScheduler.Start(context.Background())
 	defer taskScheduler.Stop()
@@ -125,7 +152,8 @@ func main() {
 
 	log.Printf("Starting Snowflake Emulator on port %s", port) //nolint:gosec // G706: port is from env var at startup, not attacker-controlled
 	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("Server failed: %v", err) //nolint:gocritic // exitAfterDefer: intentional - OS cleans up on exit
+		log.Printf("Server failed: %v", err)
+		return
 	}
 }
 
@@ -203,6 +231,7 @@ func newRouter(
 		r.Get("/warehouses", restAPIHandler.ListWarehouses)
 		r.Post("/warehouses", restAPIHandler.CreateWarehouse)
 		r.Get("/warehouses/{warehouse}", restAPIHandler.GetWarehouse)
+		r.Put("/warehouses/{warehouse}", restAPIHandler.AlterWarehouse)
 		r.Delete("/warehouses/{warehouse}", restAPIHandler.DeleteWarehouse)
 		r.Post("/warehouses/{warehouse}:resume", restAPIHandler.ResumeWarehouse)
 		r.Post("/warehouses/{warehouse}:suspend", restAPIHandler.SuspendWarehouse)

@@ -311,6 +311,64 @@ func (r *Repository) initMetadataTables(ctx context.Context) error {
 			schema_name VARCHAR,
 			warehouse VARCHAR
 		)`,
+		`CREATE TABLE IF NOT EXISTS _metadata_warehouses (
+			id VARCHAR PRIMARY KEY,
+			name VARCHAR NOT NULL UNIQUE,
+			state VARCHAR NOT NULL DEFAULT 'SUSPENDED',
+			size VARCHAR NOT NULL DEFAULT 'X-SMALL',
+			comment VARCHAR,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			owner VARCHAR,
+			auto_resume BOOLEAN NOT NULL DEFAULT TRUE,
+			auto_suspend INTEGER NOT NULL DEFAULT 600,
+			last_resumed_at TIMESTAMP,
+			last_suspended_at TIMESTAMP,
+			last_activity_at TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS _metadata_roles (
+			id VARCHAR PRIMARY KEY,
+			name VARCHAR NOT NULL UNIQUE,
+			comment VARCHAR,
+			system_role BOOLEAN NOT NULL DEFAULT FALSE,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS _metadata_users (
+			id VARCHAR PRIMARY KEY,
+			name VARCHAR NOT NULL UNIQUE,
+			password_hash VARCHAR NOT NULL,
+			default_role_id VARCHAR,
+			disabled BOOLEAN NOT NULL DEFAULT FALSE,
+			must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+			comment VARCHAR,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+		)`,
+		`CREATE TABLE IF NOT EXISTS _metadata_user_role_grants (
+			user_id VARCHAR NOT NULL,
+			role_id VARCHAR NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(user_id, role_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS _metadata_role_role_grants (
+			child_role_id VARCHAR NOT NULL,
+			parent_role_id VARCHAR NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(child_role_id, parent_role_id)
+		)`,
+		`CREATE TABLE IF NOT EXISTS _metadata_warehouse_privilege_grants (
+			role_id VARCHAR NOT NULL,
+			warehouse_name VARCHAR NOT NULL,
+			privilege VARCHAR NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(role_id, warehouse_name, privilege)
+		)`,
+		`CREATE TABLE IF NOT EXISTS _metadata_object_privilege_grants (
+			role_id VARCHAR NOT NULL,
+			object_type VARCHAR NOT NULL,
+			object_name VARCHAR NOT NULL,
+			privilege VARCHAR NOT NULL,
+			created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+			UNIQUE(role_id, object_type, object_name, privilege)
+		)`,
 		`CREATE TABLE IF NOT EXISTS _metadata_procedures (
 			id VARCHAR PRIMARY KEY,
 			schema_id VARCHAR NOT NULL,
@@ -394,6 +452,8 @@ func (r *Repository) initMetadataTables(ctx context.Context) error {
 		`ALTER TABLE _metadata_query_history ADD COLUMN IF NOT EXISTS database_name VARCHAR`,
 		`ALTER TABLE _metadata_query_history ADD COLUMN IF NOT EXISTS schema_name VARCHAR`,
 		`ALTER TABLE _metadata_query_history ADD COLUMN IF NOT EXISTS warehouse VARCHAR`,
+		`ALTER TABLE _metadata_query_history ADD COLUMN IF NOT EXISTS queued_at TIMESTAMP`,
+		`ALTER TABLE _metadata_query_history ADD COLUMN IF NOT EXISTS execution_started_at TIMESTAMP`,
 		`ALTER TABLE _metadata_dynamic_tables ADD COLUMN IF NOT EXISTS definition_database VARCHAR`,
 		`ALTER TABLE _metadata_dynamic_tables ADD COLUMN IF NOT EXISTS definition_schema VARCHAR`,
 	}
@@ -589,6 +649,9 @@ func (r *Repository) DropDatabase(ctx context.Context, id string) error {
 
 	// Execute database drop in a transaction for atomicity
 	err = r.mgr.ExecTx(ctx, func(tx *sql.Tx) error {
+		if err := deleteObjectPrivilegesTx(ctx, tx, "DATABASE", db.Name); err != nil {
+			return err
+		}
 		// Drop DuckDB schema
 		dropSchemaSQL := fmt.Sprintf("DROP SCHEMA IF EXISTS %s CASCADE", db.Name)
 		if _, err := tx.ExecContext(ctx, dropSchemaSQL); err != nil {
@@ -778,31 +841,30 @@ func (r *Repository) DropSchema(ctx context.Context, id string) error {
 	if err != nil {
 		return err
 	}
-
-	// Delete all tables in this schema first
-	deleteTablesQuery := `DELETE FROM _metadata_tables WHERE schema_id = ?`
-	if _, err := r.mgr.Exec(ctx, deleteTablesQuery, id); err != nil {
-		return fmt.Errorf("failed to delete table metadata: %w", err)
-	}
-
-	// Delete schema metadata
-	query := `DELETE FROM _metadata_schemas WHERE id = ?`
-	result, err := r.mgr.Exec(ctx, query, id)
+	database, err := r.GetDatabase(ctx, schema.DatabaseID)
 	if err != nil {
-		return fmt.Errorf("failed to delete schema metadata: %w", err)
+		return err
 	}
-
-	rowsAffected, err := result.RowsAffected()
-	if err != nil {
-		return fmt.Errorf("failed to get rows affected: %w", err)
-	}
-
-	if rowsAffected == 0 {
-		return fmt.Errorf("schema with ID %s not found", id)
-	}
-
-	_ = schema // Suppress unused variable warning
-	return nil
+	return r.mgr.ExecTx(ctx, func(tx *sql.Tx) error {
+		if err := deleteObjectPrivilegesTx(ctx, tx, "SCHEMA", database.Name+"."+schema.Name); err != nil {
+			return err
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM _metadata_tables WHERE schema_id = ?`, id); err != nil {
+			return fmt.Errorf("failed to delete table metadata: %w", err)
+		}
+		result, err := tx.ExecContext(ctx, `DELETE FROM _metadata_schemas WHERE id = ?`, id)
+		if err != nil {
+			return fmt.Errorf("failed to delete schema metadata: %w", err)
+		}
+		rowsAffected, err := result.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rowsAffected == 0 {
+			return fmt.Errorf("schema with ID %s not found", id)
+		}
+		return nil
+	})
 }
 
 // CreateTable creates a new table in a schema.
@@ -913,15 +975,20 @@ func (r *Repository) RegisterTable(ctx context.Context, schemaID, name, tableTyp
 // DeleteTableMetadata removes only the catalog entry for a table. It is used
 // after SQL execution has already removed the physical DuckDB table.
 func (r *Repository) DeleteTableMetadata(ctx context.Context, schemaID, name string) error {
-	_, err := r.mgr.Exec(ctx,
-		`DELETE FROM _metadata_tables WHERE schema_id = ? AND name = ?`,
-		schemaID,
-		strings.ToUpper(name),
-	)
+	schema, err := r.GetSchema(ctx, schemaID)
 	if err != nil {
-		return fmt.Errorf("failed to delete table metadata: %w", err)
+		return err
 	}
-	return nil
+	database, err := r.GetDatabase(ctx, schema.DatabaseID)
+	if err != nil {
+		return err
+	}
+	return r.mgr.ExecTx(ctx, func(tx *sql.Tx) error {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM _metadata_tables WHERE schema_id = ? AND name = ?`, schemaID, strings.ToUpper(name)); err != nil {
+			return fmt.Errorf("failed to delete table metadata: %w", err)
+		}
+		return deleteObjectPrivilegesTx(ctx, tx, "TABLE", database.Name+"."+schema.Name+"."+strings.ToUpper(name))
+	})
 }
 
 // GetTable retrieves a table by ID.
@@ -1102,6 +1169,9 @@ func (r *Repository) DropTable(ctx context.Context, id string) error {
 	// Execute table drop in a transaction for atomicity
 	fullyQualifiedName := fmt.Sprintf("%s.%s_%s", db.Name, schema.Name, table.Name)
 	err = r.mgr.ExecTx(ctx, func(tx *sql.Tx) error {
+		if err := deleteObjectPrivilegesTx(ctx, tx, "TABLE", db.Name+"."+schema.Name+"."+table.Name); err != nil {
+			return err
+		}
 		// Drop DuckDB table with schema prefix
 		dropTableSQL := fmt.Sprintf("DROP TABLE IF EXISTS %s", fullyQualifiedName)
 		if _, err := tx.ExecContext(ctx, dropTableSQL); err != nil {
@@ -1829,7 +1899,7 @@ func (r *Repository) DeleteDynamicTable(ctx context.Context, schemaID, name stri
 }
 
 // MaterializeDynamicTable atomically replaces the physical result and both catalog records.
-func (r *Repository) MaterializeDynamicTable(ctx context.Context, schemaID, name, targetLag, warehouse, definition, definitionDatabase, definitionSchema, databaseName, physicalName, materializeSQL string) (*DynamicTable, error) {
+func (r *Repository) MaterializeDynamicTable(ctx context.Context, schemaID, name, targetLag, warehouse, definition, definitionDatabase, definitionSchema, databaseName, physicalName, materializeSQL, ownerRoleID string) (*DynamicTable, error) {
 	id := uuid.New().String()
 	err := r.mgr.ExecTx(ctx, func(tx *sql.Tx) error {
 		if _, err := tx.ExecContext(ctx, materializeSQL); err != nil {
@@ -1850,12 +1920,13 @@ func (r *Repository) MaterializeDynamicTable(ctx context.Context, schemaID, name
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO _metadata_dynamic_tables
 			(id, schema_id, name, target_lag, warehouse, definition, definition_database, definition_schema, created_at, last_refreshed_at, owner)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, '')
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP, ?)
 			ON CONFLICT (schema_id, name) DO UPDATE SET target_lag = EXCLUDED.target_lag,
 			warehouse = EXCLUDED.warehouse, definition = EXCLUDED.definition,
 			definition_database = EXCLUDED.definition_database, definition_schema = EXCLUDED.definition_schema,
-			created_at = EXCLUDED.created_at, last_refreshed_at = EXCLUDED.last_refreshed_at`,
-			id, schemaID, strings.ToUpper(name), targetLag, strings.ToUpper(warehouse), definition, definitionDatabase, definitionSchema)
+			created_at = EXCLUDED.created_at, last_refreshed_at = EXCLUDED.last_refreshed_at,
+			owner = EXCLUDED.owner`,
+			id, schemaID, strings.ToUpper(name), targetLag, strings.ToUpper(warehouse), definition, definitionDatabase, definitionSchema, ownerRoleID)
 		if err != nil {
 			return fmt.Errorf("failed to register dynamic table definition: %w", err)
 		}

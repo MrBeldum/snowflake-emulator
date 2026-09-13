@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/nnnkkk7/snowflake-emulator/pkg/connection"
+	"github.com/nnnkkk7/snowflake-emulator/pkg/identity"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/metadata"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/stage"
+	"github.com/nnnkkk7/snowflake-emulator/pkg/warehouse"
 )
 
 // Binding validation regexes to prevent SQL injection
@@ -47,6 +49,24 @@ type Executor struct {
 	dynamicTableProcessor *DynamicTableProcessor
 	stageProcessor        *StageProcessor
 	warehouseValidator    func(context.Context, string) error
+	warehouseManager      *warehouse.Manager
+	identityService       *identity.Service
+}
+
+// WithIdentityService enables SQL identity catalog management.
+func WithIdentityService(service *identity.Service) ExecutorOption {
+	return func(e *Executor) { e.identityService = service }
+}
+
+// WithWarehouseManager makes warehouse lifecycle and admission govern compute.
+func WithWarehouseManager(manager *warehouse.Manager) ExecutorOption {
+	return func(e *Executor) {
+		e.warehouseManager = manager
+		e.warehouseValidator = func(ctx context.Context, name string) error {
+			_, err := manager.GetWarehouse(ctx, name)
+			return err
+		}
+	}
 }
 
 // ExecutorOption configures an Executor.
@@ -117,6 +137,8 @@ func (e *Executor) withPinnedConnection(ctx context.Context, fn func(*Executor) 
 	return e.mgr.WithConnection(ctx, func(mgr *connection.Manager) error {
 		pinnedRepo := e.repo.WithManager(mgr)
 		pinned := NewExecutor(mgr, pinnedRepo, WithWarehouseValidator(e.warehouseValidator))
+		pinned.warehouseManager = e.warehouseManager
+		pinned.identityService = e.identityService.WithRepository(pinnedRepo)
 		if e.mergeProcessor != nil {
 			pinned.mergeProcessor = NewMergeProcessor(pinned)
 		}
@@ -138,10 +160,43 @@ func (e *Executor) Query(ctx context.Context, sql string) (*Result, error) {
 
 // QueryWithContext executes a query using Snowflake database/schema context.
 func (e *Executor) QueryWithContext(ctx context.Context, executionContext ExecutionContext, sql string) (*Result, error) {
+	if e.identityService != nil {
+		if result, handled, err := e.queryIdentityStatement(ctx, sql); handled {
+			return result, err
+		}
+	}
+	if e.warehouseManager != nil && isShowWarehouses(sql) {
+		return e.showWarehouses(ctx)
+	}
+	if err := e.authorizeObjectStatement(ctx, executionContext, sql); err != nil {
+		return nil, err
+	}
+	if e.warehouseManager != nil && RequiresWarehouse(sql) && !executionContext.warehouseAcquired {
+		if executionContext.Warehouse == "" {
+			return nil, fmt.Errorf("a warehouse is required to execute this statement")
+		}
+		if err := e.authorizeWarehouse(ctx, executionContext, identity.PrivilegeUsage); err != nil {
+			return nil, err
+		}
+		lease, err := e.warehouseManager.Acquire(ctx, executionContext.Warehouse, executionContext.OnWarehouseQueued)
+		if err != nil {
+			return nil, err
+		}
+		defer lease.Release()
+		executionContext.warehouseAcquired = true
+		if executionContext.OnWarehouseRunning != nil {
+			executionContext.OnWarehouseRunning()
+		}
+	}
+	return e.queryWithContext(ctx, executionContext, sql)
+}
+
+func (e *Executor) queryWithContext(ctx context.Context, executionContext ExecutionContext, sql string) (*Result, error) {
 	if err := e.validateExecutionContext(ctx, executionContext); err != nil {
 		return nil, err
 	}
 	classifier := NewClassifier()
+	sql = rewriteSessionFunctions(sql, executionContext)
 	if result, handled, err := e.queryWithProcessor(ctx, executionContext, sql, classifier); handled {
 		return result, err
 	}
@@ -503,9 +558,64 @@ func (e *Executor) Execute(ctx context.Context, sql string) (*ExecResult, error)
 
 // ExecuteWithContext executes a statement using Snowflake database/schema context.
 func (e *Executor) ExecuteWithContext(ctx context.Context, executionContext ExecutionContext, sql string) (*ExecResult, error) {
+	if e.identityService != nil {
+		if result, handled, err := e.executeIdentityStatement(ctx, sql); handled {
+			return result, err
+		}
+	}
+	if e.warehouseManager != nil {
+		if warehouseName, requiresOperate := warehouseLifecycleTarget(sql); requiresOperate {
+			operationContext := executionContext
+			operationContext.Warehouse = warehouseName
+			if err := e.authorizeWarehouse(ctx, operationContext, identity.PrivilegeOperate); err != nil {
+				return nil, err
+			}
+		}
+		if result, handled, err := e.executeWarehouseStatement(ctx, sql); handled {
+			return result, err
+		}
+	}
+	if err := e.authorizeObjectStatement(ctx, executionContext, sql); err != nil {
+		return nil, err
+	}
+	if e.warehouseManager != nil && RequiresWarehouse(sql) && !executionContext.warehouseAcquired {
+		if executionContext.Warehouse == "" {
+			return nil, fmt.Errorf("a warehouse is required to execute this statement")
+		}
+		if err := e.authorizeWarehouse(ctx, executionContext, identity.PrivilegeUsage); err != nil {
+			return nil, err
+		}
+		lease, err := e.warehouseManager.Acquire(ctx, executionContext.Warehouse, executionContext.OnWarehouseQueued)
+		if err != nil {
+			return nil, err
+		}
+		defer lease.Release()
+		executionContext.warehouseAcquired = true
+		if executionContext.OnWarehouseRunning != nil {
+			executionContext.OnWarehouseRunning()
+		}
+	}
+	return e.executeWithContext(ctx, executionContext, sql)
+}
+
+func (e *Executor) authorizeWarehouse(ctx context.Context, executionContext ExecutionContext, privilege string) error {
+	if executionContext.Principal == nil {
+		if executionContext.Role != "" {
+			return fmt.Errorf("role %s is not an authenticated principal", executionContext.Role)
+		}
+		return nil
+	}
+	if e.identityService == nil || executionContext.Principal.RoleID == "" || executionContext.Role == "" {
+		return fmt.Errorf("authenticated role context is incomplete")
+	}
+	return e.identityService.AuthorizeWarehouse(ctx, executionContext.Principal.RoleID, executionContext.Warehouse, privilege)
+}
+
+func (e *Executor) executeWithContext(ctx context.Context, executionContext ExecutionContext, sql string) (*ExecResult, error) {
 	if err := e.validateExecutionContext(ctx, executionContext); err != nil {
 		return nil, err
 	}
+	sql = rewriteSessionFunctions(sql, executionContext)
 	// Use classifier to detect DDL statements that need metadata tracking
 	classifier := NewClassifier()
 	if err := e.dynamicTableProcessor.RejectOrdinaryMutation(ctx, executionContext, sql); err != nil {
@@ -524,11 +634,29 @@ func (e *Executor) ExecuteWithContext(ctx context.Context, executionContext Exec
 	// For CREATE TABLE, we need to register it in metadata
 	if classifier.IsCreateTable(sql) {
 		originalSQL := sql
-		rewrittenSQL, err := e.rewriteTablesWithContext(ctx, executionContext, sql)
+		// A CTAS body can read from a stream, same as any other SELECT — the
+		// stream name has to become its underlying append-only subquery
+		// before table-name qualification, or it is qualified as though it
+		// were an ordinary table that does not physically exist. Snowflake
+		// documents CTAS as one of the DML-like statements that consumes a
+		// stream, the same as INSERT ... SELECT, so a CTAS that succeeds
+		// advances the offset too.
+		rewrittenSQL, consumptions, err := e.streamProcessor.rewriteReferencesForConsumption(ctx, executionContext, sql)
 		if err != nil {
 			return nil, err
 		}
-		return e.executeCreateTable(ctx, executionContext, originalSQL, rewrittenSQL)
+		rewrittenSQL, err = e.rewriteTablesWithContext(ctx, executionContext, rewrittenSQL)
+		if err != nil {
+			return nil, err
+		}
+		result, err := e.executeCreateTable(ctx, executionContext, originalSQL, rewrittenSQL)
+		if err != nil {
+			return nil, err
+		}
+		if err := e.streamProcessor.advanceOffsets(ctx, consumptions); err != nil {
+			return nil, err
+		}
+		return result, nil
 	}
 
 	// For DROP TABLE, we need to remove it from metadata
@@ -562,6 +690,12 @@ func (e *Executor) ExecuteWithContext(ctx context.Context, executionContext Exec
 
 func (e *Executor) executeCatalogStatement(ctx context.Context, executionContext ExecutionContext, sql string, classifier *Classifier) (*ExecResult, bool, error) {
 	switch {
+	case classifier.IsCreateDatabase(sql):
+		result, err := e.executeCreateDatabase(ctx, sql)
+		return result, true, err
+	case classifier.IsDropDatabase(sql):
+		result, err := e.executeDropDatabase(ctx, sql)
+		return result, true, err
 	case classifier.IsCreateSchema(sql):
 		result, err := e.executeCreateSchema(ctx, executionContext, sql)
 		return result, true, err
@@ -831,7 +965,7 @@ func (e *Executor) ExecuteWithHistoryAndContext(ctx context.Context, executionCo
 	startTime := time.Now()
 
 	// Record query start (non-blocking on failure)
-	entry, err := e.repo.RecordQueryStart(ctx, sessionID, queryID, sql)
+	entry, err := e.repo.RecordQueryStart(ctx, sessionID, queryID, RedactSensitiveSQL(sql))
 	if err != nil {
 		log.Printf("Failed to record query start: %v", err)
 	}
@@ -864,7 +998,7 @@ func (e *Executor) QueryWithHistoryAndContext(ctx context.Context, executionCont
 	startTime := time.Now()
 
 	// Record query start (non-blocking on failure)
-	entry, err := e.repo.RecordQueryStart(ctx, sessionID, queryID, sql)
+	entry, err := e.repo.RecordQueryStart(ctx, sessionID, queryID, RedactSensitiveSQL(sql))
 	if err != nil {
 		log.Printf("Failed to record query start: %v", err)
 	}

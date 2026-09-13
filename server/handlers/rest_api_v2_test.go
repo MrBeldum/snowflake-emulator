@@ -17,8 +17,10 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/google/go-cmp/cmp"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/connection"
+	"github.com/nnnkkk7/snowflake-emulator/pkg/identity"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/metadata"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/query"
+	"github.com/nnnkkk7/snowflake-emulator/pkg/session"
 	"github.com/nnnkkk7/snowflake-emulator/pkg/stage"
 	"github.com/nnnkkk7/snowflake-emulator/server/types"
 )
@@ -84,7 +86,7 @@ func TestRestAPIv2Handler_InternalStageCSVWorkflow(t *testing.T) {
 
 	submit := func(statement string) types.StatementResponse {
 		t.Helper()
-		requestBody, err := json.Marshal(types.SubmitStatementRequest{Statement: statement, Database: "TEST_DB", Schema: "PUBLIC"})
+		requestBody, err := json.Marshal(types.SubmitStatementRequest{Statement: statement, Database: "TEST_DB", Schema: "PUBLIC", Warehouse: "COMPUTE_WH"})
 		if err != nil {
 			t.Fatalf("marshal statement request: %v", err)
 		}
@@ -185,6 +187,7 @@ func TestRestAPIv2Handler_WarehouseSizeRoundTrip(t *testing.T) {
 	router := chi.NewRouter()
 	router.Post("/api/v2/warehouses", handler.CreateWarehouse)
 	router.Get("/api/v2/warehouses/{warehouse}", handler.GetWarehouse)
+	router.Put("/api/v2/warehouses/{warehouse}", handler.AlterWarehouse)
 
 	tests := []struct {
 		name    string
@@ -227,6 +230,39 @@ func TestRestAPIv2Handler_WarehouseSizeRoundTrip(t *testing.T) {
 			}
 		})
 	}
+
+	request := httptest.NewRequest(http.MethodPost, "/api/v2/warehouses", strings.NewReader(`{"name":"MANUAL_WH","size":"SMALL","auto_resume":false,"auto_suspend":0}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusCreated {
+		t.Fatalf("POST configuration status = %d, body = %s", response.Code, response.Body.String())
+	}
+	if !strings.Contains(response.Body.String(), `"auto_resume":false`) || !strings.Contains(response.Body.String(), `"auto_suspend":0`) {
+		t.Fatalf("explicit disabled settings missing from response: %s", response.Body.String())
+	}
+	var created types.WarehouseResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.AutoResume || created.AutoSuspend != 0 {
+		t.Fatalf("explicit false/zero settings were not preserved: %#v", created)
+	}
+
+	request = httptest.NewRequest(http.MethodPut, "/api/v2/warehouses/MANUAL_WH", strings.NewReader(`{"size":"LARGE","auto_resume":true,"auto_suspend":15}`))
+	request.Header.Set("Content-Type", "application/json")
+	response = httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusOK {
+		t.Fatalf("PUT status = %d, body = %s", response.Code, response.Body.String())
+	}
+	var altered types.WarehouseResponse
+	if err := json.Unmarshal(response.Body.Bytes(), &altered); err != nil {
+		t.Fatal(err)
+	}
+	if altered.Size != "LARGE" || !altered.AutoResume || altered.AutoSuspend != 15 {
+		t.Fatalf("altered warehouse = %#v", altered)
+	}
 }
 
 func TestRestAPIv2Handler_SubmitStatement_Sync(t *testing.T) {
@@ -236,6 +272,7 @@ func TestRestAPIv2Handler_SubmitStatement_Sync(t *testing.T) {
 		Statement: "SELECT 1 AS num",
 		Database:  "TEST_DB",
 		Schema:    "PUBLIC",
+		Warehouse: "COMPUTE_WH",
 	}
 	body, _ := json.Marshal(reqBody)
 
@@ -276,6 +313,101 @@ func TestRestAPIv2Handler_SubmitStatement_Sync(t *testing.T) {
 	}
 }
 
+func TestRestAPIv2Handler_SubmitStatement_UsesAuthenticatedPrincipal(t *testing.T) {
+	handler, router := setupRestAPIv2Handler(t)
+	ctx := context.Background()
+	identityService, err := identity.NewService(ctx, handler.repo)
+	if err != nil {
+		t.Fatalf("failed to initialize identity service: %v", err)
+	}
+	handler.executor.Configure(query.WithIdentityService(identityService))
+	principal, err := identityService.Authenticate(ctx, identity.DemoAdminUser, identity.DemoAdminPassword)
+	if err != nil {
+		t.Fatalf("failed to authenticate demo administrator: %v", err)
+	}
+	role, err := identityService.ResolveActiveRole(ctx, principal.UserID, identity.RoleAccountAdmin)
+	if err != nil {
+		t.Fatalf("failed to resolve account administrator role: %v", err)
+	}
+	if err := handler.repo.UpsertWarehouse(ctx, &metadata.WarehouseRecord{
+		ID: "compute-wh", Name: "COMPUTE_WH", State: "SUSPENDED", Size: "X-SMALL",
+		CreatedAt: time.Now(), Owner: role.Name, AutoResume: true, AutoSuspend: 600,
+	}); err != nil {
+		t.Fatalf("failed to persist test warehouse: %v", err)
+	}
+	if err := identityService.GrantWarehousePrivilege(ctx, identity.PrivilegeUsage, "COMPUTE_WH", role.Name); err != nil {
+		t.Fatalf("failed to grant warehouse usage: %v", err)
+	}
+	sessionMgr := session.NewManager(time.Hour)
+	sess, err := sessionMgr.CreateAuthenticatedSession(ctx, session.CreateInput{
+		UserID: principal.UserID, Username: principal.Username,
+		ActiveRoleID: role.ID, ActiveRole: role.Name,
+		Database: "TEST_DB", Schema: "PUBLIC", Warehouse: "COMPUTE_WH",
+	})
+	if err != nil {
+		t.Fatalf("failed to create authenticated session: %v", err)
+	}
+	handler.sessionMgr = sessionMgr
+	handler.identity = identityService
+
+	body := `{"statement":"SELECT 1","database":"TEST_DB","schema":"PUBLIC","warehouse":"COMPUTE_WH","role":"UNAVAILABLE_ROLE"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/v2/statements", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+sess.Token)
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	var response types.StatementResponse
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if response.SQLState != types.SQLState00000 {
+		t.Fatalf("authenticated REST statement failed: %+v", response)
+	}
+
+	createDatabase := `{"statement":"CREATE DATABASE PHASE7_DB","database":"TEST_DB","schema":"PUBLIC","role":"ACCOUNTADMIN"}`
+	req = httptest.NewRequest(http.MethodPost, "/api/v2/statements", strings.NewReader(createDatabase))
+	req.Header.Set("Authorization", "Bearer "+sess.Token)
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	response = types.StatementResponse{}
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("failed to decode CREATE DATABASE response: %v", err)
+	}
+	if response.SQLState != types.SQLState00000 {
+		t.Fatalf("authenticated CREATE DATABASE failed: %+v", response)
+	}
+	if _, err := handler.repo.GetDatabaseByName(ctx, "PHASE7_DB"); err != nil {
+		t.Fatalf("authenticated CREATE DATABASE was not registered: %v", err)
+	}
+
+	reader, err := identityService.CreateRole(ctx, "PHASE7_READER", "")
+	if err != nil {
+		t.Fatalf("failed to create reader role: %v", err)
+	}
+	if err := identityService.GrantRoleToUser(ctx, reader.Name, principal.Username); err != nil {
+		t.Fatalf("failed to grant reader role: %v", err)
+	}
+	useRole := `{"statement":"USE ROLE PHASE7_READER","database":"TEST_DB","schema":"PUBLIC","async":true}`
+	req = httptest.NewRequest(http.MethodPost, "/api/v2/statements", strings.NewReader(useRole))
+	req.Header.Set("Authorization", "Bearer "+sess.Token)
+	recorder = httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+	response = types.StatementResponse{}
+	if err := json.NewDecoder(recorder.Body).Decode(&response); err != nil {
+		t.Fatalf("failed to decode USE ROLE response: %v", err)
+	}
+	if response.SQLState != types.SQLState00000 {
+		t.Fatalf("authenticated USE ROLE failed: %+v", response)
+	}
+	updated, err := sessionMgr.ValidateSession(ctx, sess.Token)
+	if err != nil {
+		t.Fatalf("failed to reload session: %v", err)
+	}
+	if updated.ActiveRole != reader.Name || updated.ActiveRoleID != reader.ID {
+		t.Fatalf("active role was not updated: %+v", updated)
+	}
+}
+
 func TestRestAPIv2Handler_SubmitStatement_WithBindings(t *testing.T) {
 	_, router := setupRestAPIv2Handler(t)
 
@@ -283,6 +415,7 @@ func TestRestAPIv2Handler_SubmitStatement_WithBindings(t *testing.T) {
 		Statement: "SELECT :1 AS num, :2 AS name",
 		Database:  "TEST_DB",
 		Schema:    "PUBLIC",
+		Warehouse: "COMPUTE_WH",
 		Bindings: map[string]*types.BindingValue{
 			"1": {Type: "FIXED", Value: "42"},
 			"2": {Type: "TEXT", Value: "hello"},
@@ -334,7 +467,7 @@ func TestRestAPIv2Handler_StreamUsesRequestContext(t *testing.T) {
 
 	execute := func(statement string) types.StatementResponse {
 		t.Helper()
-		requestBody := types.SubmitStatementRequest{Statement: statement, Database: "LEARNING_DB", Schema: "PUBLIC"}
+		requestBody := types.SubmitStatementRequest{Statement: statement, Database: "LEARNING_DB", Schema: "PUBLIC", Warehouse: "COMPUTE_WH"}
 		body, err := json.Marshal(requestBody)
 		if err != nil {
 			t.Fatalf("json.Marshal() error = %v", err)
@@ -641,7 +774,7 @@ func TestTranslateStatementDoesNotExecute(t *testing.T) {
 	}
 
 	// Selecting from it must still work: the preview ran nothing.
-	probe := `{"statement":"SELECT * FROM preview_probe","database":"TEST_DB","schema":"PUBLIC"}`
+	probe := `{"statement":"SELECT * FROM preview_probe","database":"TEST_DB","schema":"PUBLIC","warehouse":"COMPUTE_WH"}`
 	rec = httptest.NewRecorder()
 	router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v2/statements", strings.NewReader(probe)))
 
@@ -659,7 +792,7 @@ func TestRestAPIv2Handler_ListSchemaObjects(t *testing.T) {
 
 	run := func(statement string) {
 		t.Helper()
-		body := `{"statement":` + strconv.Quote(statement) + `,"database":"TEST_DB","schema":"PUBLIC"}`
+		body := `{"statement":` + strconv.Quote(statement) + `,"database":"TEST_DB","schema":"PUBLIC","warehouse":"COMPUTE_WH"}`
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v2/statements", strings.NewReader(body)))
 		if rec.Code != http.StatusOK {
@@ -763,7 +896,7 @@ func TestRestAPIv2Handler_ListSchemaObjects(t *testing.T) {
 			})
 		}
 
-		queryBody := `{"statement":"SELECT * FROM active_users","database":"TEST_DB","schema":"PUBLIC"}`
+		queryBody := `{"statement":"SELECT * FROM active_users","database":"TEST_DB","schema":"PUBLIC","warehouse":"COMPUTE_WH"}`
 		recorder = httptest.NewRecorder()
 		router.ServeHTTP(recorder, httptest.NewRequest(http.MethodPost, "/api/v2/statements", strings.NewReader(queryBody)))
 		if recorder.Code != http.StatusOK || strings.Contains(recorder.Body.String(), "does not exist") {
@@ -822,7 +955,7 @@ func TestRestAPIv2Handler_ListStatements(t *testing.T) {
 
 	submit := func(statement string) {
 		t.Helper()
-		body := `{"statement":` + strconv.Quote(statement) + `,"database":"TEST_DB","schema":"PUBLIC"}`
+		body := `{"statement":` + strconv.Quote(statement) + `,"database":"TEST_DB","schema":"PUBLIC","warehouse":"COMPUTE_WH"}`
 		rec := httptest.NewRecorder()
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v2/statements", strings.NewReader(body)))
 	}
@@ -888,7 +1021,7 @@ func TestRestAPIv2Handler_ListStatementsLimit(t *testing.T) {
 
 	for i := 0; i < 3; i++ {
 		rec := httptest.NewRecorder()
-		body := `{"statement":"SELECT ` + strconv.Itoa(i) + `"}`
+		body := `{"statement":"SELECT ` + strconv.Itoa(i) + `","warehouse":"COMPUTE_WH"}`
 		router.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/api/v2/statements", strings.NewReader(body)))
 	}
 

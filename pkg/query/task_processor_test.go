@@ -20,14 +20,11 @@ func setupTaskTest(t *testing.T) (*Executor, context.Context, ExecutionContext) 
 		t.Fatalf("GetSchemaByName() error = %v", err)
 	}
 	warehouseManager := warehouse.NewManager()
-	if _, err := warehouseManager.CreateWarehouse(ctx, "TASK_WH", "X-SMALL", ""); err != nil {
+	if _, err := warehouseManager.CreateWarehouse(ctx, "TASK_WH", defaultWarehouseSize, ""); err != nil {
 		t.Fatalf("CreateWarehouse() error = %v", err)
 	}
-	executor.Configure(WithWarehouseValidator(func(ctx context.Context, name string) error {
-		_, err := warehouseManager.GetWarehouse(ctx, name)
-		return err
-	}))
-	return executor, ctx, ExecutionContext{Database: "TASK_DB", Schema: "PUBLIC"}
+	executor.Configure(WithWarehouseManager(warehouseManager))
+	return executor, ctx, ExecutionContext{Database: "TASK_DB", Schema: "PUBLIC", Warehouse: "TASK_WH"}
 }
 
 func TestTaskLifecycleAndManualExecution(t *testing.T) {
