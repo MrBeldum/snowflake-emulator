@@ -101,7 +101,6 @@ func TestExecutor_CreateTemporaryAndTransientTables(t *testing.T) {
 	}
 }
 
-
 func TestTranslator_CreateTransientTableWithLeadingComments(t *testing.T) {
 	translator := NewTranslator()
 	tests := []struct {
